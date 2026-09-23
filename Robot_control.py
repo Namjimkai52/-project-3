@@ -1,390 +1,221 @@
-import os
-import time
+#!/usr/bin/env python3
+"""
+robot_control.py (เวอร์ชันสมบูรณ์: ขับเคลื่อนล้อหน้า + แก้ Servo SG90 กระตุก)
+- สลับขั้วมอเตอร์ในซอฟต์แวร์ เพื่อให้ล้อขับเคลื่อนเป็นล้อหน้า
+- ปรับค่าความถี่ให้ตรงกับ SG90 (1500us คือจุดศูนย์กลาง)
+- เพิ่มคำสั่ง pi.write(PIN, 0) เพื่อดึงขาสัญญาณลงกราวด์ทันทีที่ปล่อยมือ
+"""
+
 import struct
-import threading
-from datetime import datetime
-import cv2
-from flask import Flask, Response, render_template_string, send_file, jsonify
+import time
+import RPi.GPIO as GPIO
+import pigpio
 
-app = Flask(__name__)
+# ---------------- ตั้งค่า GPIO: มอเตอร์ ----------------
+# สลับขั้ว IN เพื่อพลิกให้ฝั่งล้อขับเคลื่อนกลายเป็น "ด้านหน้า"
+IN1, IN2 = 27, 17  # (แก้จาก 17, 27)
+IN3, IN4 = 23, 22  # (แก้จาก 22, 23)
+PWM_FREQ_MOTOR = 1000
 
-# โฟลเดอร์เก็บภาพถ่าย (เก็บถาวรบน Pi จนกว่าจะลบเอง)
-IMAGE_DIR = "captures"
-os.makedirs(IMAGE_DIR, exist_ok=True)
+MOVE_SPEED = 80
+TURN_SPEED = 70
 
-# ---------------- ตั้งค่าที่ปรับได้ ----------------
-# ลองปรับ 2 ค่านี้ถ้าภาพหมุนผิดทิศ / กลับด้านผิด
-#   ROTATE_MODE ตัวเลือก: None, cv2.ROTATE_90_CLOCKWISE,
-#                          cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180
-#   FLIP_MODE   ตัวเลือก: None (ไม่พลิก), 0 (พลิกบน-ล่าง), 1 (พลิกซ้าย-ขวา), -1 (พลิกทั้งคู่)
-ROTATE_MODE = None
-FLIP_MODE = 1
+# ---------------- ตั้งค่า GPIO: Servo 1 & 2 ----------------
+SERVO1_PIN = 18
+SERVO2_PIN = 19
 
-# ค่านี้คือตำแหน่ง (%) ที่ "จุดตรงหน้ากล้องจริง" ปรากฏอยู่ในเฟรมดิบ ได้มาจากการคลิก
-# calibrate ด้วย camera_center_test.py โปรแกรมจะ crop ภาพให้จุดนี้เลื่อนมาอยู่กึ่งกลาง
-# เฟรมโดยอัตโนมัติ (เสียขอบภาพด้านที่เบี่ยงไปนิดหน่อย แลกกับความแม่นยำของจุดกึ่งกลาง)
-RECENTER_X_PERCENT = 12.9
-RECENTER_Y_PERCENT = 43.1
+# จุดหยุดและหมุนสำหรับ SG90 360 องศา (อ้างอิงจุดศูนย์กลางที่ 1500 us)
+SERVO_CW_US = 1600   # หมุนทิศทางที่ 1
+SERVO_CCW_US = 1400  # หมุนทิศทางที่ 2
 
-# กากบาทแสดงผลกึ่งกลางเสมอ เพราะภาพถูก recenter มาให้ตรงแล้วด้วยค่าด้านบน
-CROSSHAIR_X_PERCENT = 50
-CROSSHAIR_Y_PERCENT = 50
+# ---------------- เริ่มต้น GPIO (สำหรับมอเตอร์) ----------------
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+GPIO.setup([IN1, IN2, IN3, IN4], GPIO.OUT)
 
-# ตัวแปรสถานะ
-latest_photo_name = None
-latest_frame = None
-frame_lock = threading.Lock()
-take_photo_flag = False
+pwm_in1 = GPIO.PWM(IN1, PWM_FREQ_MOTOR)
+pwm_in2 = GPIO.PWM(IN2, PWM_FREQ_MOTOR)
+pwm_in3 = GPIO.PWM(IN3, PWM_FREQ_MOTOR)
+pwm_in4 = GPIO.PWM(IN4, PWM_FREQ_MOTOR)
 
-# เปิดใช้งานกล้อง USB
-cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+for p in (pwm_in1, pwm_in2, pwm_in3, pwm_in4):
+    p.start(0)
 
+# ---------------- เริ่มต้น pigpio (สำหรับ Servo) ----------------
+pi = pigpio.pi()
+if not pi.connected:
+    print("ไม่สามารถเชื่อมต่อ pigpiod ได้! กรุณารัน 'sudo pigpiod' ใน Terminal ก่อน")
+    exit()
 
-def recenter_frame(frame):
-    """
-    Crop ภาพแบบไม่สมมาตร ให้จุดที่ระบุด้วย RECENTER_X/Y_PERCENT เลื่อนมาอยู่กึ่งกลาง
-    เฟรมพอดี แล้ว resize กลับเป็นขนาดเดิม เพื่อให้ทุกเฟรมมีขนาดคงที่เท่ากันเสมอ
-    """
-    h, w = frame.shape[:2]
-    px = int(w * RECENTER_X_PERCENT / 100.0)
-    py = int(h * RECENTER_Y_PERCENT / 100.0)
+def set_servo1(duty_us):
+    """เปิด-ปิดสัญญาณ Servo 1 เฉพาะตอนมีคำสั่ง"""
+    if duty_us is None:
+        pi.set_servo_pulsewidth(SERVO1_PIN, 0)  # ตัดสัญญาณ PWM
+        pi.write(SERVO1_PIN, 0)                 # ดึงสัญญาณลงกราวด์ป้องกันคลื่นแทรก
+    else:
+        pi.set_servo_pulsewidth(SERVO1_PIN, duty_us)
 
-    # ระยะจาก "จุดที่ต้องการ" ไปถึงขอบภาพแต่ละด้าน เอาค่าที่สั้นกว่ามาทำครึ่งความกว้าง/สูง
-    # ของกรอบ crop เพื่อให้จุดนั้นอยู่กึ่งกลางเป๊ะหลัง crop เสมอ
-    half_w = min(px, w - px)
-    half_h = min(py, h - py)
+def set_servo2(duty_us):
+    """เปิด-ปิดสัญญาณ Servo 2 เฉพาะตอนมีคำสั่ง"""
+    if duty_us is None:
+        pi.set_servo_pulsewidth(SERVO2_PIN, 0)  # ตัดสัญญาณ PWM
+        pi.write(SERVO2_PIN, 0)                 # ดึงสัญญาณลงกราวด์ป้องกันคลื่นแทรก
+    else:
+        pi.set_servo_pulsewidth(SERVO2_PIN, duty_us)
 
-    if half_w <= 0 or half_h <= 0:
-        return frame  # กันพังถ้าค่า percent ผิดเพี้ยนจนคำนวณไม่ได้
+def set_motor(pwm_forward, pwm_backward, speed):
+    speed = max(-100, min(100, speed))
+    if speed >= 0:
+        pwm_forward.ChangeDutyCycle(speed)
+        pwm_backward.ChangeDutyCycle(0)
+    else:
+        pwm_forward.ChangeDutyCycle(0)
+        pwm_backward.ChangeDutyCycle(-speed)
 
-    x1, x2 = px - half_w, px + half_w
-    y1, y2 = py - half_h, py + half_h
+def set_motors(left_speed, right_speed):
+    set_motor(pwm_in1, pwm_in2, left_speed)
+    set_motor(pwm_in3, pwm_in4, right_speed)
 
-    cropped = frame[y1:y2, x1:x2]
-    recentered = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
-    return recentered
+# ---------------- Mapping จอยสติ๊ก PS4 ----------------
+JS_DEVICE = "/dev/input/js0"
+EVENT_FORMAT = "IhBB"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
 
+JS_EVENT_BUTTON = 0x01
+JS_EVENT_AXIS = 0x02
+JS_EVENT_INIT = 0x80
 
-def process_frame(raw_frame):
-    """ปรับทิศทางภาพ (หมุน/พลิก) แล้ว crop ให้ recenter ตามจุดที่ calibrate ไว้"""
-    frame = raw_frame
-    if ROTATE_MODE is not None:
-        frame = cv2.rotate(frame, ROTATE_MODE)
-    if FLIP_MODE is not None:
-        frame = cv2.flip(frame, FLIP_MODE)
-    frame = recenter_frame(frame)
-    return frame
+AXIS_DPAD_X = 6
+AXIS_DPAD_Y = 7
+AXIS_L2 = 2
+AXIS_R2 = 5
 
+BUTTON_L1 = 4
+BUTTON_R1 = 5
 
-def camera_loop():
-    """เธรดดึงภาพจากกล้องต่อเนื่อง"""
-    global latest_frame, latest_photo_name, take_photo_flag
-    while True:
-        success, raw_frame = cap.read()
-        if not success:
-            continue
+TRIGGER_THRESHOLD = 0.3
 
-        frame = process_frame(raw_frame)
+axis_state = {
+    AXIS_DPAD_X: 0,
+    AXIS_DPAD_Y: 0,
+    AXIS_L2: -32767,
+    AXIS_R2: -32767,
+}
 
-        with frame_lock:
-            latest_frame = frame.copy()
+servo1_direction = 1
+servo2_direction = 1
+r1_prev_state = 0
+l1_prev_state = 0
+current_s1_state = "stop"
+current_s2_state = "stop"
 
-        if take_photo_flag:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"capture_{timestamp}.jpg"
-            filepath = os.path.join(IMAGE_DIR, filename)
+def normalize(raw_value):
+    return raw_value / 32767.0
 
-            cv2.imwrite(filepath, frame)
-            latest_photo_name = filename
-            take_photo_flag = False
-            print(f"\n[CAMERA] บันทึกภาพถ่ายสำเร็จ: {filepath}")
+def dpad_direction(value):
+    if value < -1000:
+        return -1
+    elif value > 1000:
+        return 1
+    return 0
 
-        time.sleep(0.01)
+def main():
+    global current_s1_state, current_s2_state
+    global servo1_direction, servo2_direction
+    global r1_prev_state, l1_prev_state
 
+    print(f"กำลังเปิดจอย: {JS_DEVICE}")
+    try:
+        jsdev = open(JS_DEVICE, "rb")
+    except FileNotFoundError:
+        print("ไม่พบจอยสติ๊ก! ตรวจสอบว่าเชื่อมต่อจอยแล้วหรือยัง")
+        return
+        
+    print("เปิดจอยสำเร็จ กด Ctrl+C เพื่อหยุด")
 
-def joystick_loop():
-    """เธรดตรวจจับปุ่มจากจอยสติ๊ก PS4"""
-    global take_photo_flag
-    device_path = "/dev/input/js0"
+    # ปิดสัญญาณ Servo เริ่มต้นให้นิ่งสนิท
+    set_servo1(None)
+    set_servo2(None)
 
     try:
-        js = open(device_path, "rb")
-        print("[JOYSTICK] เชื่อมต่อสำเร็จ! กดปุ่ม Circle (O) เพื่อถ่ายรูป")
-    except FileNotFoundError:
-        print(f"[JOYSTICK] ไม่พบอุปกรณ์ {device_path}")
-        return
-
-    event_format = 'IhBB'
-    event_size = struct.calcsize(event_format)
-
-    while True:
-        try:
-            event_data = js.read(event_size)
-            if not event_data:
-                break
-            time_ms, value, ev_type, number = struct.unpack(event_format, event_data)
-
-            # Button Event (0x01): กดลง (value == 1) ที่ปุ่ม Circle (number == 1)
-            if (ev_type & 0x01) and value == 1 and number == 1:
-                print("\n[JOYSTICK] กดปุ่ม Circle (O) -> สั่งบันทึกภาพ")
-                take_photo_flag = True
-        except Exception:
-            break
-
-
-HTML_PAGE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Robot Camera Center Stream</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body {
-            background-color: #121212;
-            color: #fff;
-            font-family: Arial, sans-serif;
-            text-align: center;
-            margin: 0;
-            padding: 20px;
-        }
-        .container {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 24px;
-            margin-top: 15px;
-        }
-        .card {
-            background: #1e1e1e;
-            padding: 15px;
-            border-radius: 12px;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
-            display: inline-block;
-        }
-        .stream-wrapper {
-            position: relative;
-            display: inline-block;
-            width: 560px;
-            max-width: 100%;
-        }
-        .crosshair-x {
-            position: absolute;
-            top: {{ crosshair_y }}%;
-            left: 0;
-            width: 100%;
-            height: 2px;
-            background-color: rgba(0, 255, 128, 0.7);
-            transform: translateY(-50%);
-            pointer-events: none;
-        }
-        .crosshair-y {
-            position: absolute;
-            top: 0;
-            left: {{ crosshair_x }}%;
-            width: 2px;
-            height: 100%;
-            background-color: rgba(0, 255, 128, 0.7);
-            transform: translateX(-50%);
-            pointer-events: none;
-        }
-        .center-circle {
-            position: absolute;
-            top: {{ crosshair_y }}%;
-            left: {{ crosshair_x }}%;
-            width: 32px;
-            height: 32px;
-            border: 2px solid rgba(0, 255, 128, 0.9);
-            border-radius: 50%;
-            transform: translate(-50%, -50%);
-            pointer-events: none;
-        }
-        img {
-            width: 560px;
-            max-width: 100%;
-            height: auto;
-            border-radius: 8px;
-            display: block;
-            background: #000;
-        }
-        .file-label {
-            margin-top: 10px;
-            font-size: 14px;
-            color: #00ff80;
-        }
-        a.gallery-link {
-            display: inline-block;
-            margin-top: 20px;
-            color: #00ff80;
-            text-decoration: none;
-            font-size: 15px;
-        }
-        a.gallery-link:hover { text-decoration: underline; }
-    </style>
-</head>
-<body>
-    <h2>🤖 Robot Camera Stream & Center Target</h2>
-    <p>กดปุ่ม <b>Circle (O)</b> บนจอย PS4 เพื่อถ่ายรูป | เส้นกากบาทสีเขียวคือจุดศูนย์กลางกล้อง</p>
-
-    <div class="container">
-        <div class="card">
-            <h3>🔴 ภาพสดเล็งเป้า (Live Stream)</h3>
-            <div class="stream-wrapper">
-                <img src="/video_feed" alt="Live Camera">
-                <div class="crosshair-x"></div>
-                <div class="crosshair-y"></div>
-                <div class="center-circle"></div>
-            </div>
-        </div>
-        <div class="card">
-            <h3>📸 ภาพถ่ายล่าสุด (Latest Capture)</h3>
-            <img id="captured-img" src="/latest_photo" alt="ยังไม่มีภาพถ่าย">
-            <div id="file-name" class="file-label">รอคำสั่งถ่ายรูป...</div>
-        </div>
-    </div>
-
-    <a class="gallery-link" href="/gallery">📁 ดูภาพที่ถ่ายไว้ทั้งหมด / ดาวน์โหลด</a>
-
-    <script>
-        let lastFile = "";
-        setInterval(() => {
-            fetch('/check_status')
-                .then(res => res.json())
-                .then(data => {
-                    if (data.latest && data.latest !== lastFile) {
-                        lastFile = data.latest;
-                        document.getElementById('captured-img').src = '/latest_photo?t=' + new Date().getTime();
-                        document.getElementById('file-name').innerText = 'ไฟล์: ' + lastFile;
-                    }
-                });
-        }, 800);
-    </script>
-</body>
-</html>
-"""
-
-GALLERY_PAGE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>คลังภาพที่ถ่ายไว้</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body {
-            background-color: #121212;
-            color: #fff;
-            font-family: Arial, sans-serif;
-            text-align: center;
-            padding: 20px;
-        }
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-            gap: 16px;
-            margin-top: 20px;
-        }
-        .photo-card {
-            background: #1e1e1e;
-            border-radius: 10px;
-            padding: 10px;
-        }
-        .photo-card img {
-            width: 100%;
-            border-radius: 6px;
-        }
-        .photo-card a {
-            display: inline-block;
-            margin-top: 8px;
-            color: #00ff80;
-            text-decoration: none;
-            font-size: 13px;
-        }
-        a.back-link {
-            color: #00ff80;
-            text-decoration: none;
-        }
-    </style>
-</head>
-<body>
-    <a class="back-link" href="/">&larr; กลับหน้าหลัก</a>
-    <h2>📁 คลังภาพที่ถ่ายไว้ทั้งหมด ({{ count }} ภาพ)</h2>
-    <div class="grid">
-        {% for name in photos %}
-        <div class="photo-card">
-            <img src="/photo/{{ name }}" alt="{{ name }}">
-            <div>{{ name }}</div>
-            <a href="/photo/{{ name }}" download>⬇ ดาวน์โหลด</a>
-        </div>
-        {% endfor %}
-    </div>
-</body>
-</html>
-"""
-
-
-@app.route('/')
-def index():
-    return render_template_string(
-        HTML_PAGE,
-        crosshair_x=CROSSHAIR_X_PERCENT,
-        crosshair_y=CROSSHAIR_Y_PERCENT,
-    )
-
-
-@app.route('/gallery')
-def gallery():
-    files = sorted(os.listdir(IMAGE_DIR), reverse=True)
-    files = [f for f in files if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-    return render_template_string(GALLERY_PAGE, photos=files, count=len(files))
-
-
-@app.route('/photo/<filename>')
-def photo(filename):
-    filepath = os.path.join(IMAGE_DIR, filename)
-    if os.path.isfile(filepath):
-        return send_file(filepath)
-    return Response(status=404)
-
-
-def generate_frames():
-    while True:
-        with frame_lock:
-            if latest_frame is None:
+        while True:
+            evbuf = jsdev.read(EVENT_SIZE)
+            if not evbuf:
                 continue
-            ret, buffer = cv2.imencode('.jpg', latest_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
-            if not ret:
-                continue
-            frame_bytes = buffer.tobytes()
 
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-        time.sleep(0.03)
+            _time, value, ev_type, number = struct.unpack(EVENT_FORMAT, evbuf)
+            ev_type_clean = ev_type & ~JS_EVENT_INIT
 
+            # ปุ่มสลับทิศ R1 / L1
+            if ev_type_clean == JS_EVENT_BUTTON:
+                if number == BUTTON_R1:
+                    if value == 1 and r1_prev_state == 0:
+                        servo1_direction *= -1
+                        print(f"\n[Servo 1] สลับทิศเป็น: {'ตามเข็ม' if servo1_direction == 1 else 'ทวนเข็ม'}")
+                    r1_prev_state = value
 
-@app.route('/video_feed')
-def video_feed():
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+                elif number == BUTTON_L1:
+                    if value == 1 and l1_prev_state == 0:
+                        servo2_direction *= -1
+                        print(f"\n[Servo 2] สลับทิศเป็น: {'ตามเข็ม' if servo2_direction == 1 else 'ทวนเข็ม'}")
+                    l1_prev_state = value
 
+            # แกน D-pad, R2, L2
+            if ev_type_clean == JS_EVENT_AXIS:
+                if number in axis_state:
+                    axis_state[number] = value
 
-@app.route('/check_status')
-def check_status():
-    return jsonify({"latest": latest_photo_name})
+                # มอเตอร์ DC
+                x = dpad_direction(axis_state[AXIS_DPAD_X])
+                y = -dpad_direction(axis_state[AXIS_DPAD_Y])
+                left_speed = (y * MOVE_SPEED) + (x * TURN_SPEED)
+                right_speed = (y * MOVE_SPEED) - (x * TURN_SPEED)
+                set_motors(left_speed, right_speed)
 
+                # Servo 1 (R2): กดค้าง = หมุน, ปล่อย = ตัดไฟหยุดสนิท
+                r2_amount = (normalize(axis_state[AXIS_R2]) + 1.0) / 2.0
+                if r2_amount > TRIGGER_THRESHOLD:
+                    s1_duty = SERVO_CW_US if servo1_direction == 1 else SERVO_CCW_US
+                    s1_label = "หมุน"
+                    set_servo1(s1_duty)
+                else:
+                    s1_label = "หยุด"
+                    set_servo1(None)
 
-@app.route('/latest_photo')
-def latest_photo():
-    if latest_photo_name:
-        return send_file(os.path.join(IMAGE_DIR, latest_photo_name))
-    return Response(status=404)
+                current_s1_state = s1_label
 
+                # Servo 2 (L2): กดค้าง = หมุน, ปล่อย = ตัดไฟหยุดสนิท
+                l2_amount = (normalize(axis_state[AXIS_L2]) + 1.0) / 2.0
+                if l2_amount > TRIGGER_THRESHOLD:
+                    s2_duty = SERVO_CW_US if servo2_direction == 1 else SERVO_CCW_US
+                    s2_label = "หมุน"
+                    set_servo2(s2_duty)
+                else:
+                    s2_label = "หยุด"
+                    set_servo2(None)
 
-if __name__ == '__main__':
-    t_cam = threading.Thread(target=camera_loop, daemon=True)
-    t_cam.start()
+                current_s2_state = s2_label
 
-    t_joy = threading.Thread(target=joystick_loop, daemon=True)
-    t_joy.start()
+                print(
+                    f"Motors L:{left_speed:+.0f}% R:{right_speed:+.0f}% | "
+                    f"S1(R2):{current_s1_state} | S2(L2):{current_s2_state}   ",
+                    end="\r",
+                )
 
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+    except KeyboardInterrupt:
+        print("\n\nกำลังหยุดระบบและคืนค่า GPIO...")
+
+    finally:
+        set_motors(0, 0)
+        set_servo1(None)
+        set_servo2(None)
+        time.sleep(0.2)
+        for p in (pwm_in1, pwm_in2, pwm_in3, pwm_in4):
+            p.stop()
+        GPIO.cleanup()
+        pi.stop()
+        jsdev.close()
+        print("ปิดโปรแกรมเรียบร้อย")
+
+if __name__ == "__main__":
+    main()
