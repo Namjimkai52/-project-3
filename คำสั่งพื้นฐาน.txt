@@ -1,0 +1,14 @@
+คำสั่งแรก
+ssh soranathkonde@10.27.221.117
+เข้าบลูทูธ
+bluetoothctl connect 12:DA:5A:EF:89:6D	
+โค้ดหลัก รันsudo pigpiod ก่อน	
+sudo python3 Robot_control.py
+โค้ดกล้อง
+sudo python3 cam_capture.py
+
+เปิดบรวเชอร์
+
+เทสกล้อง
+python3 camera_center_test.py
+
