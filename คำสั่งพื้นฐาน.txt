@@ -1,14 +1,15 @@
-คำสั่งแรก
+คำสั่งแรก(wifi -> ssid = nnn, password = aaaaaaaa)
 ssh soranathkonde@10.27.221.117
+(ถ้าเข้าไม่ได้ ip เปลี่ยน ใช้ Fing ในการหา ip)
 เข้าบลูทูธ
 bluetoothctl connect 12:DA:5A:EF:89:6D	
-โค้ดหลัก รันsudo pigpiod ก่อน	
+โค้ดหลัก รัน sudo pigpiod ก่อน	
 sudo python3 Robot_control.py
 โค้ดกล้อง
 sudo python3 cam_capture.py
 
 เปิดบรวเชอร์
-
+(มีในโค้ด cam_capture)
 เทสกล้อง
 python3 camera_center_test.py
 
